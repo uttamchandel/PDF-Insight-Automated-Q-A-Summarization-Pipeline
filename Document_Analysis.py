@@ -1,66 +1,30 @@
+import gradio as gr
 import pdfplumber
-
-pdf_path = "/content/google_terms_of_service_en_in.pdf"
-
-output_text_file = "extracted_text.txt"
-
-with pdfplumber.open(pdf_path) as pdf:
-    extracted_text = ""
-    for page in pdf.pages:
-        extracted_text += page.extract_text()
-
-with open(output_text_file, "w") as text_file:
-    text_file.write(extracted_text)
-
-print(f"Text extracted and saved to {output_text_file}")
-
-with open("/content/extracted_text.txt", "r") as file:
-    document_text = file.read()
-
-# preview the document content
-print(document_text[:500])  # preview the first 500 characters
-
+import pandas as pd
+import nltk
+from nltk.tokenize import sent_tokenize
 from transformers import pipeline
 
-# load the summarization pipeline
-summarizer = pipeline("summarization", model="t5-small")
-
-# summarize the document text (you can summarize parts if the document is too large)
-summary = summarizer(document_text[:1000], max_length=150, min_length=30, do_sample=False)
-print("Summary:", summary[0]['summary_text'])
-
-import nltk
+# --- 1. Load Models & Setup (Run once) ---
+print("Loading models... please wait.")
 nltk.download('punkt')
-from nltk.tokenize import sent_tokenize
 
-# split text into sentences
-sentences = sent_tokenize(document_text)
-
-# combine sentences into passages
-passages = []
-current_passage = ""
-for sentence in sentences:
-    if len(current_passage.split()) + len(sentence.split()) < 200:  # adjust the word limit as needed
-        current_passage += " " + sentence
-    else:
-        passages.append(current_passage.strip())
-        current_passage = sentence
-if current_passage:
-    passages.append(current_passage.strip())
-
-    # load the question generation pipeline
+# Load pipelines globally so they don't reload on every button click
+summarizer = pipeline("summarization", model="t5-small")
 qg_pipeline = pipeline("text2text-generation", model="valhalla/t5-base-qg-hl")
+qa_pipeline = pipeline("question-answering", model="deepset/roberta-base-squad2")
 
-# function to generate questions using the pipeline
+# --- 2. Your Helper Function ---
+# (I kept your exact logic for generating at least 3 questions)
 def generate_questions_pipeline(passage, min_questions=3):
     input_text = f"generate questions: {passage}"
     results = qg_pipeline(input_text)
     questions = results[0]['generated_text'].split('<sep>')
     
-    # ensure we have at least 3 questions
+    # Ensure we have at least 3 questions
     questions = [q.strip() for q in questions if q.strip()]
     
-    # if fewer than 3 questions, try to regenerate from smaller parts of the passage
+    # If fewer than 3 questions, try to regenerate from smaller parts
     if len(questions) < min_questions:
         passage_sentences = passage.split('. ')
         for i in range(len(passage_sentences)):
@@ -71,34 +35,75 @@ def generate_questions_pipeline(passage, min_questions=3):
             additional_questions = additional_results[0]['generated_text'].split('<sep>')
             questions.extend([q.strip() for q in additional_questions if q.strip()])
     
-    return questions[:min_questions]  # return only the top 3 questions
+    return questions[:min_questions]
 
-# generate questions from passages
-for idx, passage in enumerate(passages):
-    questions = generate_questions_pipeline(passage)
-    print(f"Passage {idx+1}:\n{passage}\n")
-    print("Generated Questions:")
-    for q in questions:
-        print(f"- {q}")
-    print(f"\n{'-'*50}\n")
+# --- 3. Main Processing Function for Gradio ---
+def process_pdf(file_obj):
+    # A. Extract Text using pdfplumber
+    extracted_text = ""
+    # file_obj.name gives the temporary path of the uploaded file
+    with pdfplumber.open(file_obj.name) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                extracted_text += text
 
-qa_pipeline = pipeline("question-answering", model="deepset/roberta-base-squad2")
+    if not extracted_text:
+        return "No text found in PDF.", pd.DataFrame()
 
-# function to track and answer only unique questions
-def answer_unique_questions(passages, qa_pipeline):
-    answered_questions = set()  # to store unique questions
+    # B. Generate Summary
+    # Summarizing the first 1000 chars as per your original code
+    summary_result = summarizer(extracted_text[:1000], max_length=150, min_length=30, do_sample=False)
+    summary_text = summary_result[0]['summary_text']
 
-    for idx, passage in enumerate(passages):
+    # C. Chunking (Your logic)
+    sentences = sent_tokenize(extracted_text)
+    passages = []
+    current_passage = ""
+    for sentence in sentences:
+        if len(current_passage.split()) + len(sentence.split()) < 200:
+            current_passage += " " + sentence
+        else:
+            passages.append(current_passage.strip())
+            current_passage = sentence
+    if current_passage:
+        passages.append(current_passage.strip())
+
+    # D. Generate Q&A (Your loop logic, adapted for output)
+    qa_data = []
+    answered_questions = set()
+
+    # NOTE: Limit to first 5 passages for speed in the web demo. 
+    # Remove '[:5]' to process the whole document.
+    for passage in passages[:5]: 
         questions = generate_questions_pipeline(passage)
 
         for question in questions:
-            if question not in answered_questions:  # check if the question has already been answered
+            if question not in answered_questions:
+                # Answer the question
                 answer = qa_pipeline({'question': question, 'context': passage})
-                print(f"Q: {question}")
-                print(f"A: {answer['answer']}\n")
-                answered_questions.add(question)  # add the question to the set to avoid repetition
-        print(f"{'='*50}\n")
-              
-answer_unique_questions(passages, qa_pipeline)
+                
+                # Optional: Only show answers with decent confidence scores (> 0.01)
+                if answer['score'] > 0.01:
+                    qa_data.append([question, answer['answer']])
+                    answered_questions.add(question)
 
+    # Convert list to DataFrame for the table display
+    df = pd.DataFrame(qa_data, columns=["Generated Question", "Answer"])
+    
+    return summary_text, df
 
+# --- 4. Launch Gradio Interface ---
+demo = gr.Interface(
+    fn=process_pdf,
+    inputs=gr.File(label="Upload PDF Document", file_types=[".pdf"]),
+    outputs=[
+        gr.Textbox(label="Document Summary", lines=3),
+        gr.Dataframe(label="Q&A Pairs", headers=["Generated Question", "Answer"], wrap=True)
+    ],
+    title="PDF Intelligent Q&A Generator",
+    description="Upload a PDF. The AI will summarize it and generate unique questions with answers."
+)
+
+if __name__ == "__main__":
+    demo.launch()
